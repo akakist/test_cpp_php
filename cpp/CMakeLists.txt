@@ -4,6 +4,6 @@ add_executable(test
 main.cpp
 )
 add_definitions(-std=c++14)
-#target_link_libraries(mt-main-${PORT}.exe megatron-main  megatron-core z  pthread ${Qt5Widgets_LIBRARIES})
+target_link_libraries(test  pthread)
 install(TARGETS test DESTINATION ~/test_output)
 
