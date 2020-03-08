@@ -1,0 +1,1208 @@
+#include "corelib/mutexInspector.h"
+#include "ISSL.h"
+#include <ctime>
+#include <stdlib.h>
+#include <cstdlib>
+#include "tools_mt.h"
+#include "st_FILE.h"
+#include "JpegUtils.h"
+#include <map>
+#include "js_utils.h"
+#include "st_rsa.h"
+#include "configDB.h"
+#include "pricelService.h"
+#include "__crc64.h"
+#include "Events/System/Error/Error.h"
+#include "Events/DFS/Referrer/ToplinkDeliver.h"
+#include "Events/System/Net/http/DoListen.h"
+#include "events_PricelService.hpp"
+#include "JpegUtils.h"
+#include "dataStore.h"
+#include "WZCard.h"
+#include "coordY.h"
+#include "typeNames.h"
+#include "PQException.h"
+#include "JDraw.h"
+#include "CardWithBarcodeAndBristleCoords.h"
+#include "LFT_manual.h"
+#include "CardFactory.h"
+#include "LFTX_BARCODE_GRIFOLS.h"
+#include "getConfigByWWW.h"
+#include <hpdf.h>
+#include "JPainterHPDF.h"
+#include "Algorithm.h"
+
+bool Pricel::Service::on_startService(const systemEvent::startService*)
+{
+    MUTEX_INSPECTOR;
+
+    for(auto& z: bindAddr)
+    {
+        sendEvent(ServiceEnum::HTTP, new httpEvent::DoListen(z,ListenerBase::serviceId));
+    }
+    sendEvent(ServiceEnum::Timer,new timerEvent::SetTimer(1,nullptr,nullptr,10,ListenerBase::serviceId));
+    return true;
+}
+
+
+bool Pricel::Service::handleEvent(const REF_getter<Event::Base>& e)
+{
+
+    XTRY;
+    try {
+        MUTEX_INSPECTOR;
+        auto& ID=e->id;
+        if(systemEventEnum::startService==ID)
+            return on_startService(static_cast<const systemEvent::startService*>(e.operator ->()));
+        if(httpEventEnum::RequestIncoming==ID)
+            return on_RequestIncoming(static_cast<const httpEvent::RequestIncoming*>(e.operator ->()));
+
+
+        if(timerEventEnum::TickTimer==ID)
+        {
+            const timerEvent::TickTimer*ev=static_cast<const timerEvent::TickTimer*>(e.operator ->());
+            if(ev->tid==1)
+            {
+                std::set<std::string> rm;
+                for(auto& z: sessions)
+                {
+                    if(time(nullptr)-z.second->lastTimeSessionHit>60)
+                    {
+                        logErr2("drop session %s",z.first.c_str());
+                        rm.insert(z.first);
+
+                    }
+                }
+                for(auto& z:rm)
+                {
+                    sessions.erase(z);
+                }
+                for(auto& z: sessions)
+                {
+                    if(time(nullptr)-z.second->lastTimeImgCachedHit>20)
+                    {
+                        if(z.second->img_cached.valid())
+                        {
+                            z.second->img_cached=nullptr;
+                            logErr2("dropped img_cached %s",z.first.c_str());
+                        }
+                    }
+
+                }
+
+            }
+            return true;
+        }
+        if(webHandlerEventEnum::RequestIncoming==ID)
+            return on_RequestIncoming(static_cast<const webHandlerEvent::RequestIncoming*>(e.operator->()));
+        if(telnetEventEnum::CommandEntered==ID)
+            return on_CommandEntered(static_cast<const telnetEvent::CommandEntered*>(e.operator->()));
+        if(systemEventEnum::startService==ID)
+            return on_startService(static_cast<const systemEvent::startService*>(e.operator->()));
+        if(rpcEventEnum::IncomingOnAcceptor==ID)
+        {
+            MUTEX_INSPECTOR;
+            const rpcEvent::IncomingOnAcceptor*ev=static_cast<const rpcEvent::IncomingOnAcceptor*>(e.operator ->());
+            auto &IDA=ev->e->id;
+            (void) IDA;
+            return false;
+        }
+        if(rpcEventEnum::IncomingOnConnector==ID)
+        {
+            const rpcEvent::IncomingOnConnector*ev=static_cast<const rpcEvent::IncomingOnConnector*>(e.operator ->());
+            auto &IDC=ev->e->id;
+            (void)IDC;
+            return  false;
+
+        }
+
+    } catch(std::exception &e)
+    {
+        logErr2(" Pricel std::exception  %s",e.what());
+    }
+    XPASS;
+    return false;
+}
+
+
+bool Pricel::Service::on_CommandEntered(const telnetEvent::CommandEntered*)
+{
+
+    return true;
+}
+
+Pricel::Service::~Service()
+{
+}
+
+
+Pricel::Service::Service(const SERVICE_id& id, const std::string& nm,IInstance* ins):
+    UnknownBase(nm),
+    ListenerBuffered1Thread(this,nm,ins->getConfig(),id,ins),
+    Broadcaster(ins),
+    instance(ins)
+
+
+{
+    CardFactory::init();
+    bindAddr=ins->getConfig()->get_tcpaddr("bindAddr","INADDR_ANY:8080","bind http address");
+}
+
+bool Pricel::Service::on_RequestIncoming(const webHandlerEvent::RequestIncoming* )
+{
+    return true;
+}
+void registerPricelService(const char* pn)
+{
+    MUTEX_INSPECTOR;
+    /// регистрация в фабрике сервиса и событий
+
+    XTRY;
+    if(pn)
+    {
+        iUtils->registerPlugingInfo(COREVERSION,pn,IUtils::PLUGIN_TYPE_SERVICE,ServiceEnum::Pricel,"Pricel",getEvents_PricelService());
+    }
+    else
+    {
+        iUtils->registerService(COREVERSION,ServiceEnum::Pricel,Pricel::Service::construct,"Pricel");
+        regEvents_PricelService();
+    }
+    XPASS;
+}
+
+
+
+
+REF_getter<Pricel::Session> Pricel::Service::check_session( const REF_getter<HTTP::Request>& req,
+                                                            HTTP::Response &resp)
+{
+    MUTEX_INSPECTOR;
+    std::string session_id;
+    if(!req->in_cookies.count(SESSION_ID))
+    {
+        MUTEX_INSPECTOR;
+        I_ssl *ssl=(I_ssl*)iUtils->queryIface(Ifaces::SSL);
+        session_id=iUtils->bin2hex(ssl->rand_bytes(20));
+
+        resp.out_cookies[SESSION_ID]=session_id;
+
+    }
+    else
+    {
+        MUTEX_INSPECTOR;
+        session_id=req->in_cookies[SESSION_ID];
+    }
+    logErr2("SESSION_ID %s",session_id.c_str());
+    REF_getter<Session> S(nullptr);
+    auto it=sessions.find(session_id);
+    if(it!=sessions.end())
+        S=it->second;
+    else
+    {
+        MUTEX_INSPECTOR;
+        S=new Session(session_id);
+        sessions.insert(std::make_pair(session_id,S));
+    }
+    S->lastTimeSessionHit=time(nullptr);
+    return S;
+
+}
+std::vector<real> get_LFTC_CS_Profile(const coordY& coord,const GraphTools::FRect& fL, const REF_getter<p_MImage> & tmp_markers_image,
+                                      const std::string& channel)
+{
+    MUTEX_INSPECTOR;
+    XTRY;
+    MUTEX_INSPECTOR;
+    GraphTools::FRect _fL=coord.translateFRectFromConf(fL);
+    std::deque<MPointF> tLine;
+    std::deque<MPointF> bLine;
+    tLine=GraphTools::getLineBetweenPoints(_fL.lt,_fL.lb);
+    bLine=GraphTools::getLineBetweenPoints(_fL.rt,_fL.rb);
+
+    size_t nMin=std::min(tLine.size(),bLine.size());
+    std::vector<real> profile;
+    for(size_t i=0; i<nMin; i++)
+    {
+        std::deque<MPointF> w=GraphTools::getLineBetweenPoints(tLine[i],bLine[i]);
+
+        w.push_back(tLine[i]);
+        Frgb val=GraphTools::getAvgColor(w,tmp_markers_image);
+        if(channel=="A")
+            profile.push_back(val.r);
+        else if(channel=="B")
+            profile.push_back(val.g);
+        else if(channel=="C")
+            profile.push_back(val.b);
+        else if(channel=="D")
+            profile.push_back(val.toMrgb().gray());
+        else throw CommonError("invalid channel");
+
+    }
+
+    std::vector<real> p2;
+    for(real i=0; i<1.0; i+=0.01)
+    {
+        MUTEX_INSPECTOR;
+        size_t idx=static_cast<size_t>(i*profile.size());
+        if(idx<profile.size())
+        {
+            p2.push_back(profile[idx]);
+        }
+    }
+    std::string rs;
+    for(auto& z: p2)
+    {
+        rs+=" "+std::to_string(z);
+    }
+    return p2;
+    XPASS;
+
+}
+
+bool Pricel::Service::on_url_favicon(const httpEvent::RequestIncoming* e)
+{
+    MUTEX_INSPECTOR;
+    HTTP::Response resp;
+    resp.content=iUtils->load_file("docs/favicon.ico");
+    resp.http_content_type="image/x-icon";
+    resp.makeResponse(e->esi);
+    return true;
+
+}
+bool Pricel::Service::on_url_ping(const httpEvent::RequestIncoming* e)
+{
+    MUTEX_INSPECTOR;
+    HTTP::Response resp;
+    auto S=check_session(e->req,resp);
+    logErr2("ping from %s",S->sessionId.c_str());
+    resp.makeResponse(e->esi);
+    return true;
+
+}
+bool Pricel::Service::on_url_pricel_get_img(const httpEvent::RequestIncoming* e)
+{
+    MUTEX_INSPECTOR;
+    HTTP::Response resp;
+    auto S=check_session(e->req,resp);
+    if(!S->jpeg.valid())
+    {
+        throw CommonError("if(!S->jpeg.valid())");
+    }
+    resp.content=S->jpeg->jpeg;
+    resp.http_content_type="image/jpeg";
+    resp.makeResponse(e->esi);
+    return true;
+}
+bool Pricel::Service::on_url_pricel_get_result(const httpEvent::RequestIncoming* e)
+{
+    MUTEX_INSPECTOR;
+    try{
+        MUTEX_INSPECTOR;
+        for(auto &z: e->req->params)
+        {
+            logErr2("param-  %s: %s",z.first.c_str(),z.second.c_str());
+        }
+//        std::cout << "a";
+        Json::Value q=jparse(e->req->params["q"]);
+
+        real zoom=q["zoom"].asDouble();
+
+        real x=q["x"].asDouble();
+
+        real y=q["y"].asDouble();
+
+        if(!q.isMember("channel"))
+            throw  CommonError("channel undef");
+        std::string channel=q["channel"].asString();
+
+        logErr2("zoom x y %lf %lf %lf",zoom,x,y);
+        x/=zoom;
+        y/=zoom;
+
+        HTTP::Response resp;
+        auto S=check_session(e->req,resp);
+        if(!S->imgProcessed)
+            throw CommonError("!img processed");
+        if(!S->card_lft.valid())
+            throw CommonError("if(!S->card.valid())");
+        auto cc=dynamic_cast<LFT_manual*>(S->card_lft.operator->());
+        if(!cc)
+            throw CommonError("if(!cc)");
+
+        MPointF p_center_conf=cc->coord.translatePointToConf(MPointF(x,y));
+        logErr2("p_center_conf %s",p_center_conf.dump().toStyledString().c_str());
+        for(auto& z: e->req->params)
+        {
+            logErr2("params %s %s",z.first.c_str(),z.second.c_str());
+        }
+        real w=q["pw"].asDouble()/2.;
+
+        real h=q["ph"].asDouble()/2.;
+
+        real line_thickness=q["plh"].asDouble()/2.;
+
+
+        logErr2("w h line_thickness %lf %lf %lf",w,h,line_thickness);
+
+        GraphTools::FRect fr_conf;
+        fr_conf.lt=p_center_conf-MPointF(w,h);
+        fr_conf.rb=p_center_conf+MPointF(w,h);
+        fr_conf.lb=MPointF(fr_conf.lt.x(),fr_conf.rb.y());
+        fr_conf.rt=MPointF(fr_conf.rb.x(),fr_conf.lt.y());
+        logErr2("fr_conf %s",fr_conf.dump().toStyledString().c_str());
+        GraphTools::FRect fr_real=cc->coord.translateFRectFromConf(fr_conf);
+        logErr2("fr_real %s",fr_real.dump().toStyledString().c_str());
+
+        bpGraphUtils::GradientMode gm;
+        gm=bpGraphUtils::RemoveGradient;
+        if(!S->jpeg.valid())
+            throw CommonError("if(!S->jpeg.valid()) %s %d",__FILE__,__LINE__);
+        if(!S->img_cached.valid())
+        {
+            REF_getter<p_MImage> ir=new p_MImage(JpegUtils::ReadJpegBufIntoMImage(S->jpeg->jpeg));
+            S->img_cached=ir;
+            logErr2("img_cached restore for %s",S->sessionId.c_str());
+        }
+        S->lastTimeImgCachedHit=time(nullptr);
+
+        std::vector<real> profileL_G=get_LFTC_CS_Profile(cc->coord,fr_conf,S->img_cached,channel);
+
+        bpGraphUtils::ColocolExtremumResponse lineResponseZ;
+        lineResponseZ=bpGraphUtils::calcColocolSquareLineResponseForLine(profileL_G,
+                                                                         bpGraphUtils::Range(0,0.1),
+                                                                         bpGraphUtils::Range(0.9,1),
+                                                                         bpGraphUtils::MIN_MM,
+                                                                         line_thickness,
+                                                                         Recognize::distance(fr_conf.lt,fr_conf.lb),
+                                                                         gm);
+
+
+        real lineResponse=lineResponseZ.resp();
+        logErr2("lineresponse %s",std::to_string(lineResponse).c_str());
+
+
+        real pos=bpGraphUtils::getLftPositionByLines(cc->colorscaleResponses,lineResponse);
+
+        Json::Value out;
+        put(out["frect"],fr_real);
+        out["position"]=pos;
+        out["status"]="OK";
+        logErr2("resp %s",out.toStyledString().c_str());
+        resp.content=out.toStyledString();
+        resp.makeResponse(e->esi);
+    }
+    catch(PQException& err)
+    {
+        HTTP::Response resp;
+        Json::Value j;
+        j["status"]="FAIL";
+        j["error"]=err.what();
+        resp.content=j.toStyledString();
+        resp.makeResponse(e->esi);
+        logErr2("exc %s",err.what());
+        return true;
+
+    }
+    catch(std::exception &err)
+    {
+        HTTP::Response resp;
+        Json::Value j;
+        j["status"]="FAIL";
+        j["error"]=err.what();
+        resp.content=j.toStyledString();
+        resp.makeResponse(e->esi);
+        logErr2("exc %s",err.what());
+        return true;
+    }
+    catch(...)
+    {
+        logErr2("catched ... %s %d",__FILE__,__LINE__);
+    }
+    return true;
+}
+bool Pricel::Service::on_url_pricel_index(const httpEvent::RequestIncoming* e)
+{
+
+
+        MUTEX_INSPECTOR;
+        std::string error;
+        try{
+            if(e->req->params.count("foto"))
+            {
+                    MUTEX_INSPECTOR;
+                    HTTP::Response resp;
+                    auto S=check_session(e->req,resp);
+                    std::string jpeg=e->req->params["foto"];
+                    if(e->req->params["foto_CONTENT-TYPE"]!="image/jpeg")
+                    {
+                        throw CommonError("invalid image type, must be jpeg");
+                    }
+                    REF_getter<jpegRef> jr=new jpegRef;
+                    jr->jpeg=e->req->params["foto"];
+                    REF_getter<p_MImage> ir=new p_MImage(JpegUtils::ReadJpegBufIntoMImage(jr->jpeg));
+
+
+                    S->imgProcessed=false;
+                    Json::Value jreport;
+                    JDraw output;
+                    WZCard wzCard;
+                    auto c= wzCard.processCard(jreport,output,ir,"");
+                    auto lm=dynamic_cast<LFT_manual*>(c.operator->());
+                    if(!lm)
+                        throw CommonError("if(!lm)");
+                    S->card_lft=lm;
+
+                    if(jreport["settings"]["testType"].asString()!=type_LFT_MANUAL)
+                    {
+                        throw CommonError("invalid test type ZQ");
+                    }
+                    S->jpeg=jr;
+                    S->img_cached=ir;
+                    S->lastTimeSessionHit=time(nullptr);
+                    S->imgProcessed=true;
+
+                    resp.content=iUtils->load_file("docs/pricel_result.html");
+                    resp.makeResponse(e->esi);
+
+                return true;
+
+            }
+
+        }
+        catch(CommonError& ex)
+        {
+            error=ex.what();
+
+        }
+        catch(PQException &ex)
+        {
+            error=ex.what();
+
+        }
+        catch(std::exception& ex)
+        {
+            error=ex.what();
+        }
+        HTTP::Response resp;
+        auto S=check_session(e->req,resp);
+        resp.content=iUtils->load_file("docs/pricel_index.html");
+        resp.makeResponse(e->esi);
+
+
+        return  true;
+}
+
+bool Pricel::Service::on_RequestIncoming(const httpEvent::RequestIncoming* e)
+{
+    MUTEX_INSPECTOR;
+
+    std::deque<std::string> vurl=iUtils->splitStringDQ("/",e->req->url);
+    if(vurl.size())
+    {
+        std::string u=vurl[0];
+        vurl.pop_front();
+        if(u=="generate_card")
+        {
+            return on_url_generate_card(e);
+        }
+        if(u=="grifols")
+        {
+            if(vurl.size())
+            {
+                std::string u=vurl[0];
+                vurl.pop_front();
+                if(u=="img")
+                {
+                    return  on_url_grifols_img(e);
+                }
+            }
+            return on_url_grifolsMain(e);
+        }
+        if(u=="favicon.ico")
+            return on_url_favicon(e);
+        if(u=="ping")
+            return on_url_ping(e);
+        if(u=="pricel")
+        {
+            if(vurl.size())
+            {
+                std::string u=vurl[0];
+                vurl.pop_front();
+                if(u=="get_img")
+                    return on_url_pricel_get_img(e);
+                if(u=="get_result")
+                    return on_url_pricel_get_result(e);
+            }
+            return on_url_pricel_index(e);
+
+        }
+        if(u=="overlapped")
+        {
+            logErr2("if(u==\"overlapped\")");
+            if(vurl.size())
+            {
+                std::string u=vurl[0];
+                vurl.pop_front();
+                if(u=="get_img")
+                    return on_url_overlapped_get_img(e);
+                if(u=="get_result")
+                    return on_url_overlapped_get_result(e);
+                if(u=="get_drawing")
+                    return on_url_overlapped_get_drawing(e);
+                if(u=="get_config")
+                    return on_url_overlapped_get_config(e);
+                if(u=="update_config")
+                    return on_url_overlapped_update_config(e);
+            }
+            return on_url_overlapped_index(e);
+
+        }
+    }
+
+
+
+
+    logErr2("content %s",e->req->postContent.c_str());
+    for(auto& z: e->req->headers)
+    {
+        logErr2("head %s %s",z.first.c_str(),z.second.c_str());
+    }
+    for(auto &z : e->req->params)
+    {
+        logErr2("param %s %s",z.first.c_str(),z.second.c_str());
+
+    }
+    logErr2("url %s",e->req->url.c_str());
+
+    return true;
+}
+bool Pricel::Service::on_url_grifolsMain(const httpEvent::RequestIncoming* e)
+{
+    MUTEX_INSPECTOR;
+    {
+        MUTEX_INSPECTOR;
+
+        std::string error;
+        try{
+            if(e->req->params.count("foto"))
+            {
+                    MUTEX_INSPECTOR;
+                    HTTP::Response resp;
+                    auto S=check_session(e->req,resp);
+                    std::string jpeg=e->req->params["foto"];
+                    if(e->req->params["foto_CONTENT-TYPE"]!="image/jpeg")
+                    {
+                        throw CommonError("invalid image type, must be jpeg");
+                    }
+                    REF_getter<jpegRef> jr=new jpegRef;
+                    jr->jpeg=e->req->params["foto"];
+                    REF_getter<p_MImage> ir=new p_MImage(JpegUtils::ReadJpegBufIntoMImage(jr->jpeg));
+
+
+                    S->imgProcessed=false;
+                    Json::Value jreport;
+                    JDraw output;
+                    LFTX_BARCODE_GRIFOLS gr;
+                    gr.processGrifols(ir,output,"B");
+                    S->output.clear();
+                    S->output=output;
+                    S->jpeg=jr;
+                    S->img_cached=ir;
+                    S->lastTimeSessionHit=time(nullptr);
+                    S->imgProcessed=true;
+
+                    resp.content=iUtils->load_file("docs/grifols_result.html");
+                    resp.makeResponse(e->esi);
+
+                return true;
+
+            }
+
+        }
+        catch(CommonError& ex)
+        {
+            error=ex.what();
+
+        }
+        catch(PQException &ex)
+        {
+            error=ex.what();
+
+        }
+        catch(std::exception& ex)
+        {
+            error=ex.what();
+        }
+        HTTP::Response resp;
+        auto S=check_session(e->req,resp);
+        resp.content=iUtils->load_file("docs/grifols_index.html");
+        resp.makeResponse(e->esi);
+
+    }
+    return true;
+}
+bool Pricel::Service::on_url_grifols_img(const httpEvent::RequestIncoming* e)
+{
+    MUTEX_INSPECTOR;
+    HTTP::Response resp;
+    auto S=check_session(e->req,resp);
+
+    if(!S->img_cached.valid())
+        throw CommonError("if(!S->img_cached.valid())");
+    auto im=S->output.draw(S->img_cached,"");
+    auto jpeg=JpegUtils::getResultJpeg(im);
+    resp.content=jpeg;
+    resp.http_content_type="image/jpeg";
+    resp.makeResponse(e->esi);
+    return true;
+}
+static void error_handler  (HPDF_STATUS   error_no,
+                HPDF_STATUS   detail_no,
+                void         *user_data)
+{
+    printf ("ERROR: error_no=%04X, detail_no=%u\n", (HPDF_UINT)error_no,
+                (HPDF_UINT)detail_no);
+}
+
+bool Pricel::Service::on_url_generate_card(const httpEvent::RequestIncoming* e)
+{
+    MUTEX_INSPECTOR;
+    HTTP::Response resp;
+    auto S=check_session(e->req,resp);
+
+
+    Json::Value tt_conf;
+    std::string testName=e->req->params["testName"];
+    std::string testType=e->req->params["testType"];
+
+    CARD_id cardId;
+    cardId.container2=0;
+    {
+        MUTEX_INSPECTOR;
+        DB_POSTFIX dp;
+        CONTAINER(dp)=0;
+       cardId=WWW::getNewId(dp,testName);
+    }
+    tt_conf["name"]=testName;
+    tt_conf["type"]=testType;
+
+    Json::Value j=jparse(iUtils->load_file("cards/"+testName));
+
+    if(testType=="LFT")
+    {
+        real strip_width=atof(e->req->params["strip_width"].c_str());
+        real offset_t=atof(e->req->params["offset_t"].c_str());
+        real offset_c=atof(e->req->params["offset_c"].c_str());
+        j["strip_width"]=strip_width;
+        j["line0"]["offset_from_strip_edge_to_line_center"]=offset_t;
+        j["line1"]["offset_from_strip_edge_to_line_center"]=offset_c;
+        j["placeholder_width"]=strip_width+10;
+        j["placeholder_height"]=offset_c+5+10;
+
+    }
+    if(testType=="LFTC_PRICEL")
+    {
+        real w=atof(e->req->params["workplace_width"].c_str());
+        real h=atof(e->req->params["workplace_height"].c_str());
+        j["HOLE_WIDTH"]=w;
+        j["HOLE_HEIGHT"]=h;
+        real grab_width=atof(e->req->params["grab_width"].c_str());
+        real delta_y=atof(e->req->params["delta_y"].c_str());
+        real line_thickness=atof(e->req->params["line_thickness"].c_str());
+        j["line0"]["grab_width"]=grab_width;
+        j["line0"]["delta_y2"]=delta_y;
+        j["line0"]["line_thickness"]=line_thickness;
+    }
+    if(testType=="WZ_OVERLAPPED_COLORSCALE_CONFIGURED")
+    {
+        real placeholder_width=atoi(e->req->params["workplace_width"].c_str());
+        real placeholder_height=atoi(e->req->params["workplace_height"].c_str());
+
+        real colorscale_pad_width=atoi(e->req->params["colorscale_width"].c_str());
+        real colorscale_pad_height=atoi(e->req->params["colorscale_height"].c_str());
+        j["placeholder_width"]=placeholder_width;
+        j["placeholder_height"]=placeholder_height;
+        j["colorscale_pad_width"]=colorscale_pad_width;
+        j["colorscale_pad_height"]=colorscale_pad_height;
+    }
+
+    std::string type=tt_conf["type"].asString();
+    REF_getter<CardBase> c=CardFactory::getInstance(type);
+
+    REF_getter<ConfigureReaderJson> ccc=new ConfigureReaderJson(j);
+
+    JPainterHPDF painter;
+    c->init_layout(ccc.operator->(),&painter,tt_conf,cardId,0,1,1);
+
+    real scale=100./35.25;
+    painter.scale(scale);
+
+    MRect cardRect= painter.getCardRect();
+//    MRect cardRect=MRect(0,0,cardRect_.width()*scale,cardRect_.height()*scale);
+
+
+
+    HPDF_Doc pdf = HPDF_New (error_handler, NULL);
+    HPDF_Page page = HPDF_AddPage (pdf);
+    HPDF_Page_SetHeight(page,cardRect.height()+20*scale);
+    HPDF_Page_SetWidth(page,cardRect.width()+20*scale);
+
+
+    painter.draw(pdf,page,{10*scale,10*scale});
+
+    char s[L_tmpnam];
+    std::string fname=tmpnam(s);
+    HPDF_SaveToFile (pdf, fname.c_str());
+    HPDF_Free (pdf);
+    std::string body=iUtils->load_file(fname);
+    unlink(fname.c_str());
+
+
+
+
+
+    {
+        MUTEX_INSPECTOR;
+        std::string cfgbin=Algorithm::compress(painter.jOut.toStyledString());
+        Json::Value j;
+        j["id"]=(int)cardId.container2;
+        DB_POSTFIX dbPostfix;
+        CONTAINER(dbPostfix)=tt_conf["dbPostfix"].asInt();
+        WWW::uploadConfig(dbPostfix,cardId,cfgbin);
+    }
+
+
+    resp.content=body;
+    resp.http_content_type="application/download";
+    resp.http_header_out["Content-Disposition" ]="attachment; filename=\"card"+std::to_string(cardId.container2)+".pdf\"";
+    resp.makeResponse(e->esi);
+
+
+
+    return true;
+}
+
+
+bool Pricel::Service::on_url_overlapped_get_img(const httpEvent::RequestIncoming* e)
+{
+    MUTEX_INSPECTOR;
+    HTTP::Response resp;
+    auto S=check_session(e->req,resp);
+    if(!S->jpeg.valid())
+    {
+        throw CommonError("if(!S->jpeg.valid())");
+    }
+    resp.content=S->jpeg->jpeg;
+    resp.http_content_type="image/jpeg";
+    resp.makeResponse(e->esi);
+    return true;
+}
+bool Pricel::Service::on_url_overlapped_get_drawing(const httpEvent::RequestIncoming* e)
+{
+    MUTEX_INSPECTOR;
+    try{
+        MUTEX_INSPECTOR;
+//        for(auto &z: e->req->params)
+//        {
+//            logErr2("param-  %s: %s",z.first.c_str(),z.second.c_str());
+//        }
+//        std::cout << "a";
+        Json::Value conf=jparse(e->req->params["q"]);
+        logErr2("get_drawing: conf: %s",conf.toStyledString().c_str());
+
+//        real zoom=q["zoom"].asDouble();
+
+//        real x=q["x"].asDouble();
+
+//        real y=q["y"].asDouble();
+
+//        x/=zoom;
+//        y/=zoom;
+
+
+
+        HTTP::Response resp;
+        auto S=check_session(e->req,resp);
+        if(!S->imgProcessed)
+            throw CommonError("!img processed");
+        if(!S->card_overlapped.valid())
+            throw CommonError("if(!S->card.valid())");
+
+//        MPointF p_center_conf=S->card_overlapped->coord.translatePointToConf(MPointF(x,y));
+//        logErr2("p_center_conf %s",p_center_conf.dump().toStyledString().c_str());
+        real w=2;
+
+        real h=2;
+
+
+
+        std::vector<GraphTools::FRect> frs;
+        std::vector<std::pair<MPointF,std::string> > labels;
+        for(Json::UInt i=0;i<conf.size();i++)
+        {
+            Json::Value& pad=conf[i];
+            if(pad.isMember("x_shift") && pad.isMember("dist_edge"))
+            {
+                real x_shift=pad["x_shift"].asDouble();
+                real dist_edge=pad["dist_edge"].asDouble();
+                auto P=S->card_overlapped->getPointOnStripFromEdge(dist_edge,x_shift);
+                auto fr=S->card_overlapped->getPadRectConf(P,w,h);
+                auto fr_real=S->card_overlapped->coord.translateFRectFromConf(fr);
+                frs.push_back(fr_real);
+                labels.push_back(std::make_pair(S->card_overlapped->coord.translatePointFromConf(P),
+                                                pad["name"].asString()));
+
+            }
+            for(Json::UInt j=0;j<pad["vals"].size();j++)
+            {
+                Json::Value& val=pad["vals"][j];
+                if(val.isMember("x") && val.isMember("y"))
+                {
+                    real _x=val["x"].asDouble();
+                    real _y=val["y"].asDouble();
+                    MPointF p_conf(_x,_y);
+                    GraphTools::FRect fr_conf;
+
+                    fr_conf.lt=p_conf-MPointF(w/2.,h/2.);
+                    fr_conf.rb=p_conf+MPointF(w/2.,h/2.);
+                    fr_conf.lb=MPointF(fr_conf.lt.x(),fr_conf.rb.y());
+                    fr_conf.rt=MPointF(fr_conf.rb.x(),fr_conf.lt.y());
+                    GraphTools::FRect fr_real=S->card_overlapped->coord.translateFRectFromConf(fr_conf);
+                    frs.push_back(fr_real);
+                    labels.push_back(std::make_pair(S->card_overlapped->coord.translatePointFromConf(MPointF(_x,_y)),
+                                                    pad["name"].asString()+"."+val["name"].asString()));
+                }
+            }
+        }
+
+        Json::Value out;
+
+        if(frs.size())
+            out["hasRects"]=1;
+        else
+            out["hasRects"]=0;
+        if(labels.size())
+            out["hasLabels"]=1;
+        else
+            out["hasLabels"]=0;
+
+        for(auto &z:frs)
+        {
+            out["rects"].append(z.dump());
+
+        }
+        for(auto& z:labels)
+        {
+            Json::Value j;
+            j["text"]=z.second;
+            j["p"]=z.first.dump();
+            out["labels"].append(j);
+        }
+
+        resp.content=out.toStyledString();
+        logErr2("out: %s",out.toStyledString().c_str());
+        resp.makeResponse(e->esi);
+    }
+    catch(PQException& err)
+    {
+        HTTP::Response resp;
+        Json::Value j;
+        j["status"]="FAIL";
+        j["error"]=err.what();
+        resp.content=j.toStyledString();
+        resp.makeResponse(e->esi);
+        logErr2("exc %s",err.what());
+        return true;
+
+    }
+    catch(std::exception &err)
+    {
+        HTTP::Response resp;
+        Json::Value j;
+        j["status"]="FAIL";
+        j["error"]=err.what();
+        resp.content=j.toStyledString();
+        resp.makeResponse(e->esi);
+        logErr2("exc %s",err.what());
+        return true;
+    }
+    catch(...)
+    {
+        logErr2("catched ... %s %d",__FILE__,__LINE__);
+    }
+    return true;
+
+}
+
+bool Pricel::Service::on_url_overlapped_get_result(const httpEvent::RequestIncoming* e)
+{
+    MUTEX_INSPECTOR;
+    try{
+        MUTEX_INSPECTOR;
+//        for(auto &z: e->req->params)
+//        {
+//            logErr2("param-  %s: %s",z.first.c_str(),z.second.c_str());
+//        }
+//        std::cout << "a";
+        Json::Value q=jparse(e->req->params["q"]);
+
+        real zoom=q["zoom"].asDouble();
+
+        real x=q["x"].asDouble();
+
+        real y=q["y"].asDouble();
+
+        x/=zoom;
+        y/=zoom;
+
+
+
+        HTTP::Response resp;
+        auto S=check_session(e->req,resp);
+        if(!S->imgProcessed)
+            throw CommonError("!img processed");
+        if(!S->card_overlapped.valid())
+            throw CommonError("if(!S->card.valid())");
+
+        MPointF p_center_conf=S->card_overlapped->coord.translatePointToConf(MPointF(x,y));
+        logErr2("p_center_conf %s",p_center_conf.dump().toStyledString().c_str());
+        for(auto& z: e->req->params)
+        {
+            logErr2("params %s %s",z.first.c_str(),z.second.c_str());
+        }
+        real w=q["pw"].asDouble();
+
+        real h=q["ph"].asDouble();
+
+        Json::Value conf=q["conf"];
+        Json::Value sel=q["sel"];
+        if(sel.size()==1)
+        {
+
+            int npad=sel[(Json::UInt)0].asInt();
+            auto c=S->card_overlapped->calc_coord_on_strip(p_center_conf);
+            conf[npad]["x_shift"]=c.x_shift;
+            conf[npad]["dist_edge"]=c.dist_edge;
+        }
+        else if(sel.size()==2)
+        {
+            int npad=sel[(Json::UInt)0].asInt();
+            int nval=sel[(Json::UInt)1].asInt();
+            conf[npad]["vals"][nval]["x"]=p_center_conf.x();
+            conf[npad]["vals"][nval]["y"]=p_center_conf.y();
+
+        }
+        else throw CommonError("invalid sel");
+
+//        auto dbp=S->card_overlapped->dbId;
+//        auto cardId=S->card_overlapped->cardId;
+//        WWW::updateStripConf(dbp,cardId,conf.toStyledString());
+
+//        std::vector<GraphTools::FRect> frs;
+//        std::vector<std::pair<MPointF,std::string> > labels;
+//        for(Json::UInt i=0;i<conf.size();i++)
+//        {
+//            Json::Value& pad=conf[i];
+//            if(pad.isMember("x_shift") && pad.isMember("dist_edge"))
+//            {
+//                real x_shift=pad["x_shift"].asDouble();
+//                real dist_edge=pad["dist_edge"].asDouble();
+//                auto P=S->card_overlapped->getPointOnStripFromEdge(dist_edge,x_shift);
+//                auto fr=S->card_overlapped->getPadRectConf(P,w,h);
+//                auto fr_real=S->card_overlapped->coord.translateFRectFromConf(fr);
+//                frs.push_back(fr_real);
+//                labels.push_back(std::make_pair(S->card_overlapped->coord.translatePointFromConf(P),
+//                                                pad["name"].asString()));
+
+//            }
+//            for(Json::UInt j=0;j<pad["vals"].size();j++)
+//            {
+//                Json::Value& val=pad["vals"][j];
+//                if(val.isMember("x") && val.isMember("y"))
+//                {
+//                    real _x=val["x"].asDouble();
+//                    real _y=val["y"].asDouble();
+//                    MPointF p_conf(_x,_y);
+//                    GraphTools::FRect fr_conf;
+
+//                    fr_conf.lt=p_conf-MPointF(w/2.,h/2.);
+//                    fr_conf.rb=p_conf+MPointF(w/2.,h/2.);
+//                    fr_conf.lb=MPointF(fr_conf.lt.x(),fr_conf.rb.y());
+//                    fr_conf.rt=MPointF(fr_conf.rb.x(),fr_conf.lt.y());
+//                    GraphTools::FRect fr_real=S->card_overlapped->coord.translateFRectFromConf(fr_conf);
+//                    frs.push_back(fr_real);
+//                    labels.push_back(std::make_pair(S->card_overlapped->coord.translatePointFromConf(MPointF(_x,_y)),
+//                                                    pad["name"].asString()+"."+val["name"].asString()));
+//                }
+//            }
+//        }
+
+        Json::Value out;
+        out["conf"]=conf;
+//        for(auto &z:frs)
+//        {
+//            out["rects"].append(z.dump());
+
+//        }
+//        for(auto& z:labels)
+//        {
+//            Json::Value j;
+//            j["text"]=z.second;
+//            j["p"]=z.first.dump();
+//            out["labels"].append(j);
+//        }
+
+        resp.content=out.toStyledString();
+        logErr2("out: %s",out.toStyledString().c_str());
+        resp.makeResponse(e->esi);
+    }
+    catch(PQException& err)
+    {
+        HTTP::Response resp;
+        Json::Value j;
+        j["status"]="FAIL";
+        j["error"]=err.what();
+        resp.content=j.toStyledString();
+        resp.makeResponse(e->esi);
+        logErr2("exc %s",err.what());
+        return true;
+
+    }
+    catch(std::exception &err)
+    {
+        HTTP::Response resp;
+        Json::Value j;
+        j["status"]="FAIL";
+        j["error"]=err.what();
+        resp.content=j.toStyledString();
+        resp.makeResponse(e->esi);
+        logErr2("exc %s",err.what());
+        return true;
+    }
+    catch(...)
+    {
+        logErr2("catched ... %s %d",__FILE__,__LINE__);
+    }
+    return true;
+}
+
+bool Pricel::Service::on_url_overlapped_get_config(const httpEvent::RequestIncoming* e)
+{
+    MUTEX_INSPECTOR;
+    HTTP::Response resp;
+    auto S=check_session(e->req,resp);
+    if(!S->imgProcessed)
+        throw CommonError("!img processed");
+    if(!S->card_overlapped.valid())
+        throw CommonError("if(!S->card.valid())");
+
+    auto s=iUtils->hex2bin(iUtils->hex2bin(WWW::getStripConf(S->card_overlapped->dbId,S->card_overlapped->cardId)));
+    logErr2("get_config %s",s.c_str());
+
+    resp.content=s;
+    resp.makeResponse(e->esi);
+    return true;
+
+}
+bool Pricel::Service::on_url_overlapped_update_config(const httpEvent::RequestIncoming* e)
+{
+    MUTEX_INSPECTOR;
+    HTTP::Response resp;
+    auto S=check_session(e->req,resp);
+    if(!S->imgProcessed)
+        throw CommonError("!img processed");
+    if(!S->card_overlapped.valid())
+        throw CommonError("if(!S->card.valid())");
+    Json::Value q=jparse(e->req->params["q"]);
+    auto dbp=S->card_overlapped->dbId;
+    auto cardId=S->card_overlapped->cardId;
+    WWW::updateStripConf(dbp,cardId,iUtils->bin2hex(q.toStyledString()));
+    resp.makeResponse(e->esi);
+    return true;
+
+}
+
+
+bool Pricel::Service::on_url_overlapped_index(const httpEvent::RequestIncoming* e)
+{
+    MUTEX_INSPECTOR;
+    std::string error;
+    try{
+        if(e->req->params.count("foto"))
+        {
+            XTRY;
+                logErr2("if(e->req->params.count(\"foto\"))");
+                MUTEX_INSPECTOR;
+                HTTP::Response resp;
+                logErr2("KALL %s %d",__FILE__,__LINE__);
+                auto S=check_session(e->req,resp);
+                std::string jpeg=e->req->params["foto"];
+                if(e->req->params["foto_CONTENT-TYPE"]!="image/jpeg")
+                {
+                    throw CommonError("invalid image type, must be jpeg");
+                }
+                logErr2("KALL %s %d",__FILE__,__LINE__);
+                REF_getter<jpegRef> jr=new jpegRef;
+                jr->jpeg=e->req->params["foto"];
+                REF_getter<p_MImage> ir=new p_MImage(JpegUtils::ReadJpegBufIntoMImage(jr->jpeg));
+
+                logErr2("KALL %s %d",__FILE__,__LINE__);
+
+                S->imgProcessed=false;
+                Json::Value jreport;
+                JDraw output;
+                WZCard wzCard;
+                logErr2("KALL %s %d",__FILE__,__LINE__);
+                auto c= wzCard.processCard(jreport,output,ir,"");
+                auto lm=dynamic_cast<WZ_OVERLAPPED_COLORSCALE_CONFIGURED*>(c.operator->());
+                if(!lm)
+                    throw CommonError("if(!lm)");
+                S->card_overlapped=lm;
+
+                logErr2("KALL %s %d",__FILE__,__LINE__);
+                S->jpeg=jr;
+                S->img_cached=ir;
+                S->lastTimeSessionHit=time(nullptr);
+                S->imgProcessed=true;
+
+                logErr2("KALL %s %d",__FILE__,__LINE__);
+                resp.content=iUtils->load_file("docs/overlapped_result.html");
+                logErr2("resp.content %s",resp.content.c_str());
+                resp.makeResponse(e->esi);
+                logErr2("KALL %s %d",__FILE__,__LINE__);
+
+            return true;
+            XPASS;
+        }
+
+    }
+    catch(CommonError& ex)
+    {
+        error=(std::string)"CommonError"+ex.what();
+
+    }
+    catch(PQException &ex)
+    {
+        error=(std::string)"PQException: "+ex.what()+": "+ex.msgs;
+
+    }
+    catch(std::exception& ex)
+    {
+        error=(std::string)"std::exception"+ ex.what();
+    }
+    HTTP::Response resp;
+    auto S=check_session(e->req,resp);
+    if(error.size())
+    {
+    resp.content=iUtils->load_file("docs/overlapped_error.html");
+    resp.content=iUtils->str_replace("~error~",error,resp.content);
+    }
+    else
+        resp.content=iUtils->load_file("docs/overlapped_index.html");
+
+
+    resp.makeResponse(e->esi);
+
+
+    return  true;
+}
