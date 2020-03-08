@@ -126,17 +126,24 @@ int main(int argc, char *argv[])
     }
 
     FILE * f=fopen(argv[1],"r");
-    char buffer[1000];
-    int cnt=0;
-    while(auto ret=fgets(buffer,sizeof (buffer),f)!=NULL)
+    if(f)
     {
+	char buffer[1000];
+	int cnt=0;
+	while(auto ret=fgets(buffer,sizeof (buffer),f)!=NULL)
+	{
 
-        {
-            std::unique_lock<std::mutex> lock(mx_strings_queue_mutex);
+    	    {
+    	    std::unique_lock<std::mutex> lock(mx_strings_queue_mutex);
             mx_strings_queue.push_back({cnt,buffer});
             cond_var.notify_one();
             cnt++;
-        }
+    	    }
+	}
+    }
+    else
+    {
+	printf("Error: cannot open %s\n",argv[1]);
     }
 
     while(true)
