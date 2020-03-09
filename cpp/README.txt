@@ -3,4 +3,4 @@
 2. cd Build
 3. cmake ..
 4. make
-5. ./test ../sample.txt 'for???'
+5. ./test-cpp ../sample.txt 'for???'
