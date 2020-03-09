@@ -7,7 +7,7 @@
 struct report
 {
     /// report item
-    
+
     int lineNo;
     std::string::size_type offset;
     std::string value;
@@ -18,7 +18,7 @@ struct report
 int main(int argc, char *argv[])
 {
 
-    
+
     /// check commandline params
     if(argc!=3)
     {
@@ -45,7 +45,7 @@ int main(int argc, char *argv[])
     std::vector<std::thread> handlers;
     /// flag used to signal threads to stop. May be used without mutex lock.
     bool done=false;
-    
+
     /// string container
     std::deque<std::pair<int,std::string> > mx_strings_queue;
     /// mutex for string container
@@ -64,23 +64,23 @@ int main(int argc, char *argv[])
 
 
     /// run 10 threads
-    for(int i=0;i<10;i++)
+    for(int i=0; i<10; i++)
     {
-        handlers.push_back(std::thread([&](){
+        handlers.push_back(std::thread([&]() {
 
-	    
+
             while(!done)
             {
-        	/// extract line element from queue
+                /// extract line element from queue
                 std::pair<int,std::string> element;
                 bool isLineExtracted=false;
                 {
                     std::unique_lock<std::mutex> lock(mx_strings_queue_mutex);
-                    
+
                     /// if container is empty - wait signal from string reader thread (main thread)
                     if(mx_strings_queue.empty())
                     {
-                	/// condition wait release mutex for other threads
+                        /// condition wait release mutex for other threads
                         cond_var.wait(lock);
                         /// after wait mutex locked again
                     }
@@ -99,7 +99,7 @@ int main(int argc, char *argv[])
                     if(!m.empty())
                     {
                         std::string sample=m[0].str();
-                        
+
                         std::string::size_type offset=element.second.find(sample);
                         if(offset==std::string::npos)
                         {
@@ -110,7 +110,7 @@ int main(int argc, char *argv[])
                             r.value=sample;
                             r.lineNo=element.first;
                             r.offset=offset;
-                            
+
                             /// mutex lock start
                             std::unique_lock<std::mutex> lock(mx_reports_mutex);
                             mx_reports.push_back(r);
@@ -128,22 +128,22 @@ int main(int argc, char *argv[])
     FILE * f=fopen(argv[1],"r");
     if(f)
     {
-	char buffer[1000];
-	int cnt=0;
-	while(auto ret=fgets(buffer,sizeof (buffer),f)!=NULL)
-	{
+        char buffer[1000];
+        int cnt=0;
+        while(auto ret=fgets(buffer,sizeof (buffer),f)!=NULL)
+        {
 
-    	    {
-    	    std::unique_lock<std::mutex> lock(mx_strings_queue_mutex);
-            mx_strings_queue.push_back({cnt,buffer});
-            cond_var.notify_one();
-            cnt++;
-    	    }
-	}
+            {
+                std::unique_lock<std::mutex> lock(mx_strings_queue_mutex);
+                mx_strings_queue.push_back({cnt,buffer});
+                cond_var.notify_one();
+                cnt++;
+            }
+        }
     }
     else
     {
-	printf("Error: cannot open %s\n",argv[1]);
+        printf("Error: cannot open %s\n",argv[1]);
     }
 
     while(true)
@@ -161,7 +161,7 @@ int main(int argc, char *argv[])
             }
             else
             {
-        	cond_var.notify_all();
+                cond_var.notify_all();
             }
 
         }
@@ -183,7 +183,7 @@ int main(int argc, char *argv[])
                std::to_string(r.lineNo+1).c_str(),
                std::to_string(r.offset+1).c_str(),
                r.value.c_str()
-               );
+              );
     }
 
 
